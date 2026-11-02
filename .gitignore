@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+# demo output figures land next to the input wav
+examples/*.png
+# run logs (rjob / validation); the verdicts live in validation/results/*.json
+logs/
+validation/logs/

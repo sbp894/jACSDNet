@@ -1,0 +1,803 @@
+"""
+jACSDNet: a joint model of ferret auditory cortex and sound-event detection.
+
+Standalone, dependency-light release of the model called J0 ("joint-AC/SDNet")
+in the LBHB analyses. One network is trained jointly on two tasks:
+
+  * predicting the PSTHs of 3124 neurons recorded across 62 sites in ferret
+    auditory cortex (BNT natural sounds), and
+  * AudioSet sound-event detection (456 classes), read from the *predicted
+    neural rates* rather than from the trunk.
+
+    waveform
+      -> gammatonegram (32 ERB channels, 100 Hz, sqrt)
+      -> trunk: 4 causal residual blocks, widths 125-200, k=12 (450 ms RF)    readout 'mf'     (T, 200)
+      -> 62 site heads, concatenated: Linear + DEXP -> 3124 rates            readout 'mr'     (T, 3124)
+      -> LayerNorm(3124) per bin -> Linear(3124 -> 128, no bias)             readout 'proj'   (T, 128)  <- default
+      -> per 500-ms window: CNN10 (2-D, the 128 dims as frequency) -> fc1    readout 'clf'    (n_win, 512)
+      -> Linear(512 -> 456)                                                  readout 'logits' (n_win, 456)
+
+Typical use:
+
+    from jacsdnet_model import load_jacsdnet
+    model, cell_rtest = load_jacsdnet()
+    model.update_audio_process({'overall_db': 60})          # stimulus level (dB SPL)
+    emb, gtg = model.get_embeddings('my_sound.wav')         # (1, T, 128) projection (default)
+    psth = model.predict_psth('my_sound.wav')               # (T, 3124) predicted PSTHs
+
+The front end and the trunk/readout building blocks are copied verbatim from
+the ACNet v1 release (`acnet_model.py`); only the configuration and the
+classifier side are new.
+"""
+
+import os
+import struct
+from collections import OrderedDict
+
+# Import torch before numpy. In some MKL/OpenMP setups (e.g. conda numpy + pip
+# torch), importing numpy first deadlocks the subsequent `import torch`.
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchaudio  # only for the Resample transform; wav decoding uses stdlib struct
+import numpy as np
+
+from gtgram import gtgram
+from gtg_filters import erb_space
+
+
+WEIGHTS_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'weights', 'jacsdnet_v0.pt')
+
+# Release version. The version is also stored inside the checkpoint, so a
+# loaded model reports the version it was actually exported as.
+JACSDNET_VERSION = "v0"
+MODEL_NAME = "jACSDNet"
+
+_USABLE_CUDA = None
+
+
+def best_device():
+    """Return the best *usable* torch device: ``cuda`` only if a kernel can
+    actually run on this GPU + torch-build combination, else ``cpu``.
+
+    ``torch.cuda.is_available()`` returns True whenever a GPU is merely present,
+    even when the installed torch wheel ships no kernels for it (e.g. an old
+    GPU with a newer CUDA build). Using it to pick a device then fails at
+    runtime with ``cudaErrorNoKernelImageForDevice``. This probes usability by
+    launching one tiny kernel, caches the result, and falls back to CPU on any
+    error. Override by passing an explicit device to ``load_jacsdnet`` / ``.to()``.
+    """
+    global _USABLE_CUDA
+    if _USABLE_CUDA is None:
+        _USABLE_CUDA = False
+        if torch.cuda.is_available():
+            try:
+                _ = (torch.zeros(1, device='cuda') + 1).item()  # force launch + sync
+                _USABLE_CUDA = True
+            except Exception:
+                _USABLE_CUDA = False
+    return torch.device('cuda' if _USABLE_CUDA else 'cpu')
+
+
+# --------------------------------------------------------------------------- #
+# Audio preprocessing
+# --------------------------------------------------------------------------- #
+def remove_clicks(w, max_threshold=50, verbose=False):
+    """Log-compress samples beyond 67% of `max_threshold` (LBHB-mode only)."""
+    w_clean = w.clone()
+    crossover = 0.67 * max_threshold
+    ii = w > crossover
+    w_clean[ii] = crossover + torch.log(w_clean[ii] - crossover + 1).to(w_clean.dtype)
+    jj = w < -crossover
+    w_clean[jj] = -crossover - torch.log(-w_clean[jj] - crossover + 1).to(w_clean.dtype)
+    if verbose:
+        print(f'bins compressed down: {ii.sum().item()} up: {jj.sum().item()}')
+    return w_clean
+
+
+def _load_wav(path, int16_scale=32768.0):
+    """Decode a WAV file to a mono ``(1, n_samples)`` float32 tensor in [-1, 1].
+
+    Parses the RIFF container directly so the package needs no audio-decoding
+    dependency (soundfile / torchcodec / ffmpeg). Supports integer PCM
+    (8/16/24/32-bit) and IEEE-float (32/64-bit) WAV, including WAVE_FORMAT_EXTENSIBLE.
+
+    `int16_scale` is the divisor for 16-bit PCM. The default 32768 is the
+    full-scale convention; pass 32767 to reproduce NEMS (`nems_lbhb.runclass`
+    divides int16 by 32767). The two differ by 3e-5 relative.
+    """
+    with open(path, 'rb') as f:
+        riff = f.read()
+    if riff[:4] != b'RIFF' or riff[8:12] != b'WAVE':
+        raise ValueError(f"Not a RIFF/WAVE file: {path}")
+
+    fmt_tag = n_channels = fs = bits = None
+    raw = None
+    pos = 12
+    while pos + 8 <= len(riff):
+        cid = riff[pos:pos + 4]
+        csize = struct.unpack('<I', riff[pos + 4:pos + 8])[0]
+        body = riff[pos + 8:pos + 8 + csize]
+        if cid == b'fmt ':
+            fmt_tag, n_channels, fs, _, _, bits = struct.unpack('<HHIIHH', body[:16])
+            if fmt_tag == 0xFFFE and csize >= 26:   # EXTENSIBLE: real tag is in the subformat GUID
+                fmt_tag = struct.unpack('<H', body[24:26])[0]
+        elif cid == b'data':
+            raw = body
+        pos += 8 + csize + (csize & 1)  # chunks are word-aligned
+
+    if fmt_tag is None or raw is None:
+        raise ValueError(f"Missing fmt/data chunk in {path}")
+
+    if fmt_tag == 1:            # integer PCM
+        if bits == 8:          # 8-bit PCM is unsigned
+            data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+        elif bits == 16:
+            data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / int16_scale
+        elif bits == 24:
+            b = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
+            ints = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
+            ints[ints >= 1 << 23] -= 1 << 24       # sign-extend
+            data = ints.astype(np.float32) / (1 << 23)
+        elif bits == 32:
+            data = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+        else:
+            raise ValueError(f"Unsupported PCM bit depth {bits} in {path}")
+    elif fmt_tag == 3:         # IEEE float
+        dtype = np.float32 if bits == 32 else np.float64
+        data = np.frombuffer(raw, dtype=dtype).astype(np.float32)
+    else:
+        raise ValueError(f"Unsupported WAV format tag {fmt_tag} in {path}")
+
+    if n_channels > 1:
+        data = data.reshape(-1, n_channels).mean(axis=1)  # mix to mono
+    return torch.from_numpy(np.ascontiguousarray(data))[None, :], fs
+
+
+def nems_audio_preprocess(sig, fs_stim, fs_gtg, f_max=20e3, duration=None, fixed_amp_scale=250,
+                          lbhb_mode=False, overall_db=65, level_mode='exact', device='cpu',
+                          verbose=False, nems_match=False):
+    """
+    Resample, ramp and level-scale a waveform prior to the gammatone filterbank.
+
+    For inference outside LBHB set `lbhb_mode=False`; then `level_mode` must be
+    'exact' and the signal is scaled so its RMS matches `overall_db` dB SPL
+    (reference 20 uPa).
+
+    `nems_match=False` (the default) is the path the released ACNet weights were
+    trained on: a torchaudio polyphase resampler and a periodic Hann ramp.
+    `nems_match=True` swaps in the two choices `nems_lbhb.runclass.NAT_stim`
+    makes instead -- `scipy.signal.resample` (FFT) and a symmetric `np.hanning`
+    ramp -- so this function reproduces a NEMS recording's `stim` signal to
+    float32 precision. It needs scipy and is only for validating against NEMS;
+    it does NOT reproduce the model's training inputs.
+    """
+    sig = sig.to(device)
+    sig = sig.squeeze(0)  # assume mono
+
+    window_time = 1 / fs_gtg
+    hop_time = 1 / fs_gtg
+    fs0 = f_max * 2  # nyquist for the NEMS path
+
+    padbins = torch.tensor((window_time - hop_time) / 2 * fs0)
+    if padbins != torch.round(padbins):
+        raise ValueError("Need to adjust wav resampling rate")
+
+    if duration is not None and len(sig) < fs_stim * duration:
+        sig = torch.nn.functional.pad(sig, (0, int(fs_stim * duration) - len(sig)))
+
+    if fs_stim != fs0:
+        if nems_match:
+            # scipy's FFT resampler, as used by NAT_stim. Differs audibly little
+            # from the polyphase one (waveform r=0.9993) but enough to move the
+            # gammatonegram by a few percent, so it must be matched exactly.
+            from scipy.signal import resample as _scipy_resample
+            n_out = int(len(sig) / fs_stim * fs0)
+            sig_np = _scipy_resample(sig.detach().cpu().numpy().astype(np.float64), n_out)
+            sig = torch.tensor(sig_np, dtype=torch.float32, device=device)
+        else:
+            resampler = torchaudio.transforms.Resample(orig_freq=fs_stim, new_freq=fs0).to(device)
+            sig = resampler(sig)
+
+    if duration is not None:
+        # NAT_stim truncates to floor(Duration*fs0) after resampling, and only then
+        # ramps -- so the offset ramp has to land on the truncated end, not before it.
+        sig = sig[:int(np.floor(duration * fs0))]
+
+    # 5 ms onset/offset ramp
+    if nems_match:
+        ramp_np = np.hanning(.005 * fs0 * 2)  # symmetric, as in NAT_stim
+        ramp = torch.tensor(ramp_np[:int(np.floor(len(ramp_np) / 2))],
+                            dtype=sig.dtype, device=device)
+    else:
+        ramp = torch.hann_window(int(.005 * fs0 * 2))[:int(.005 * fs0)].to(device)
+    sig[:len(ramp)] *= ramp
+    sig[-len(ramp):] *= torch.flip(ramp, [0])
+
+    if lbhb_mode:
+        sig = remove_clicks(sig * fixed_amp_scale, 15)
+        pre_dbspl = 20 * torch.log10(torch.sqrt(torch.mean(sig ** 2)) / 20e-6)
+        if overall_db is not None:
+            if level_mode == 'approx':
+                sf = 10 ** ((80 - overall_db) / 20)
+            elif level_mode == 'exact':
+                sf = 10 ** ((pre_dbspl - overall_db) / 20)
+            sig = sig / sf
+    else:
+        pre_dbspl = 20 * torch.log10(torch.sqrt(torch.mean(sig ** 2)) / 20e-6)
+        if overall_db is not None:
+            assert level_mode == 'exact', "If lbhb_mode=False, then `level_mode` must be exact!"
+            sf = 10 ** ((pre_dbspl - overall_db) / 20)
+            sig = sig / sf
+
+    if verbose:
+        post_dbspl = 20 * torch.log10(torch.sqrt(torch.mean(sig ** 2)) / 20e-6)
+        print(f"lbhb={lbhb_mode}: dbspl pre={pre_dbspl:.2f} post={post_dbspl:.2f}")
+
+    return sig, fs0
+
+
+class GammatoneFilterbankProcessing(nn.Module):
+    """Wraps waveform preprocessing + NEMS gammatonegram + compression."""
+
+    def __init__(self, num_cfs=32, f_min=200.0, f_max=20e3, fs_gtg=100.0, overall_db=65.0,
+                 fixed_amp_scale=250.0, keep_pre_s=0., stim_dur_after_onset=None,
+                 compress='log10x', level_mode='exact', lbhb_mode=False, nems_match=False,
+                 stim_duration_s=None, verbose=False):
+        super().__init__()
+        self.num_cfs = num_cfs
+        self.f_min = f_min
+        self.f_max = f_max
+        self.fs_gtg = fs_gtg
+        self.overall_db = overall_db
+        self.fixed_amp_scale = fixed_amp_scale
+        self.keep_pre_s = keep_pre_s
+        self.stim_dur_after_onset = stim_dur_after_onset
+        self.compress = compress
+        self.level_mode = level_mode
+        self.lbhb_mode = lbhb_mode
+        self.nems_match = nems_match
+        # Zero-pad the WAVEFORM out to this many seconds before filtering, the way
+        # NAT_stim pads every clip to the trial's `Duration`. Not the same as
+        # `stim_dur_after_onset`, which zero-pads the finished gammatonegram: padding
+        # the waveform lets the filterbank ring out into the added bins, padding the
+        # gammatonegram does not. BNT wavs are 17.79 s against an 18 s Duration, so
+        # this is what makes ACNet's output line up with a NEMS stim signal.
+        self.stim_duration_s = stim_duration_s
+        self.device = best_device()
+
+    def apply_compress(self, x_mag):
+        """Apply `self.compress` to a raw (uncompressed) gammatonegram magnitude."""
+        if self.compress == 'sqrt':
+            return torch.sqrt(torch.abs(x_mag))
+        elif self.compress == 'log10x':
+            return 0.5 * torch.log(1 + 10 * x_mag)
+        elif self.compress == 'log50x':
+            return 0.5 * torch.log10(1 + 50 * x_mag)
+        elif self.compress == 'log2x':
+            return torch.log(1 + 2 * x_mag)
+        raise ValueError(f"Unknown compression '{self.compress}'")
+
+    def forward(self, sig, fs_stim, overall_db=None, fixed_amp_scale=None):
+        if overall_db is not None:
+            self.overall_db = overall_db
+        if fixed_amp_scale is not None:
+            self.fixed_amp_scale = fixed_amp_scale
+
+        w, fs_stim = nems_audio_preprocess(
+            sig, fs_stim, self.fs_gtg, self.f_max, overall_db=self.overall_db, lbhb_mode=self.lbhb_mode,
+            fixed_amp_scale=self.fixed_amp_scale, device=self.device, level_mode=self.level_mode,
+            nems_match=self.nems_match, duration=self.stim_duration_s)
+
+        x_gtg_pt = gtgram(w, fs_stim, window_time=1 / self.fs_gtg, hop_time=1 / self.fs_gtg,
+                          channels=self.num_cfs, f_min=self.f_min, f_max=self.f_max, device=self.device)
+
+        x_gtg_pt = self.apply_compress(x_gtg_pt)
+
+        # Optional trimming / padding around stimulus onset
+        if self.stim_dur_after_onset is not None:
+            post_pad_gtg = int(self.stim_dur_after_onset * self.fs_gtg) - x_gtg_pt.shape[1]
+            if post_pad_gtg < 0:
+                x_gtg_pt = x_gtg_pt[:, :post_pad_gtg]
+                post_pad_gtg = 0
+        else:
+            post_pad_gtg = 0
+
+        pre_pad_gtg = int(self.keep_pre_s * self.fs_gtg)
+        x_gtg_pt = torch.cat((torch.zeros((self.num_cfs, pre_pad_gtg), device=x_gtg_pt.device),
+                              x_gtg_pt, torch.zeros((self.num_cfs, post_pad_gtg), device=x_gtg_pt.device)),
+                             dim=1).T
+        return x_gtg_pt
+
+    def get_cfs(self):
+        # Must match the filterbank: gtgram.py builds its filters with erb_space, so
+        # reporting erb_space_hilb here overstated the top CF by up to 12.96%
+        # (channel 31: 20000 Hz reported vs 17704.8 Hz actual). Fixed 2026-09-15.
+        cfs = erb_space(torch.tensor(self.f_min), torch.tensor(self.f_max), torch.tensor(self.num_cfs))
+        cfs = torch.flip(cfs, [0])
+        return cfs.numpy().squeeze()
+
+
+# --------------------------------------------------------------------------- #
+# Backbone building blocks
+# --------------------------------------------------------------------------- #
+class Batchnorm1d_txp(nn.Module):
+    """BatchNorm over the feature dim of a (batch, time, feature) tensor."""
+
+    def __init__(self, num_features):
+        super().__init__()
+        self.num_features = num_features
+        self.norm_layer = nn.BatchNorm1d(num_features)
+
+    def forward(self, x):
+        return self.norm_layer(x.transpose(-1, -2)).transpose(-1, -2)
+
+
+class Conv1DRowLayer(nn.Module):
+    """Causal depthwise (per-frequency-channel) FIR convolution over time."""
+
+    def __init__(self, kernel_size, in_channels=1, out_channels=1, num_filters=20,
+                 pool_size=1, normalize=False):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.num_filters = num_filters
+
+        assert in_channels == out_channels == 1, "Optimized code is not set up for channels > 1"
+        assert normalize is False, "Not set up for normalization"
+
+        self.conv = nn.Conv1d(in_channels=num_filters, out_channels=num_filters,
+                              kernel_size=kernel_size, groups=num_filters, padding=0)
+        self.pad = nn.ConstantPad1d((kernel_size - 1, 0), 0)  # causal padding
+        self.pool = nn.AvgPool1d(kernel_size=pool_size, stride=pool_size) if pool_size > 1 else None
+
+    def forward(self, x):
+        if x.dim() == 2:
+            x = x[None, ...]
+        if x.dim() == 3:
+            x = x[:, None, :, :]
+        # x: [batch, 1, time, freq]
+        x = x.squeeze(1).permute(0, 2, 1)  # [batch, freq, time]
+        x = self.pad(x)
+        x = self.conv(x)
+        if self.pool:
+            x = self.pool(x)
+        return x.permute(0, 2, 1)  # [batch, time, freq]
+
+
+class ResBlock_CNN1d_W_NL_v1(nn.Module):
+    """FIR-conv -> linear -> (batchnorm) -> ReLU residual block."""
+
+    def __init__(self, input_dim, output_dim, kernel_size, in_channels=1, out_channels=1,
+                 time_pool=1, norm_1d=False, postfix='', skip=True, res_scale=1.0):
+        super().__init__()
+        self.params = {"input_dim": input_dim, "output_dim": output_dim, "kernel_size": kernel_size,
+                       "in_channels": in_channels, "out_channels": out_channels, "time_pool": time_pool,
+                       "norm_1d": norm_1d, "skip": skip}
+
+        self.shortcut = self._make_shortcut(input_dim, output_dim, time_pool) if skip else nn.Identity()
+
+        self.main = nn.Sequential()
+        self.main.add_module(
+            f"conv{postfix}", Conv1DRowLayer(kernel_size=kernel_size, in_channels=1, out_channels=1,
+                                             pool_size=time_pool, num_filters=input_dim))
+        self.main.add_module(f"linear{postfix}", nn.Linear(input_dim, output_dim))
+        if norm_1d:
+            self.main.add_module(f"bn{postfix}", Batchnorm1d_txp(output_dim))
+
+        self.layer_NL = nn.Sequential(OrderedDict([(f"nl{postfix}", nn.ReLU())]))
+
+        self.res_scale = res_scale
+        self.gamma = nn.Parameter(torch.ones(1))
+        self.register_buffer('running_grad_norm', torch.zeros(1))
+
+    def _make_shortcut(self, in_dim, out_dim, pool):
+        layers = [nn.Linear(in_dim, out_dim)]
+        if pool > 1:
+            layers.append(nn.AvgPool1d(pool, stride=pool))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.main(x)
+        if self.params['skip']:
+            out = self.gamma * self.res_scale * out + self.shortcut(x)
+        out = self.layer_NL(out)
+        return out
+
+
+class DEXP(nn.Module):
+    """
+    Double-exponential output nonlinearity, applied per neuron.
+
+        y = base + amp * exp(-exp(-exp(kappa) * x))
+    """
+
+    def __init__(self, num_nodes):
+        super().__init__()
+        self.num_nodes = num_nodes
+        self.base = nn.Parameter(torch.zeros(num_nodes, dtype=torch.float32))
+        self.amp = nn.Parameter(1.5 * torch.ones(num_nodes, dtype=torch.float32))
+        self.kappa = nn.Parameter(0.7 * torch.ones(num_nodes, dtype=torch.float32))
+
+    def forward(self, x):
+        return self.base + self.amp * torch.exp(-torch.exp(-torch.exp(self.kappa) * x))
+
+
+
+# --------------------------------------------------------------------------- #
+# Classifier building blocks (new in jACSDNet)
+# --------------------------------------------------------------------------- #
+class ProjStem(nn.Module):
+    """LayerNorm(n_neurons) per 10-ms bin -> Linear(n_neurons -> proj_dim, no bias).
+
+    The classifier's learned projection of the predicted rates. Its output is
+    jACSDNet's default embedding (readout 'proj'). Per-bin, so it is defined at
+    every 10-ms bin of any input, independently of the classifier's windows.
+    """
+
+    def __init__(self, d_in, proj_dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(int(d_in))
+        self.proj = nn.Linear(int(d_in), int(proj_dim), bias=False)
+
+    def forward(self, rates):
+        return self.proj(self.norm(rates))
+
+
+class PannsConvBlock(nn.Module):
+    """PANNs ConvBlock: 2 x (conv3x3, no bias -> BatchNorm -> ReLU), then 2x2 average pooling."""
+
+    def __init__(self, c_in, c_out):
+        super().__init__()
+        self.conv1 = nn.Conv2d(c_in, c_out, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(c_out, c_out, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(c_out)
+        self.bn2 = nn.BatchNorm2d(c_out)
+
+    def forward(self, x, pool_size=(2, 2)):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        return F.avg_pool2d(x, kernel_size=pool_size)
+
+
+class Cnn10(nn.Module):
+    """PANNs CNN10 from bn0 to fc1. Input (N, T, F) with F = the projected dims; output (N, d_pen).
+
+    bn0 normalises over F; four ConvBlocks pool time and F by 2 each; then mean over F,
+    max_T + mean_T, and fc1 + ReLU. Dropout (0.2 after each block, 0.5 before fc1) is
+    a no-op in eval mode.
+    """
+
+    def __init__(self, n_freq=128, d_pen=512):
+        super().__init__()
+        self.bn0 = nn.BatchNorm2d(n_freq)
+        self.conv_block1 = PannsConvBlock(1, 64)
+        self.conv_block2 = PannsConvBlock(64, 128)
+        self.conv_block3 = PannsConvBlock(128, 256)
+        self.conv_block4 = PannsConvBlock(256, 512)
+        self.fc1 = nn.Linear(512, d_pen, bias=True)
+
+    def forward(self, z):
+        x = z.unsqueeze(1)                                   # (N, 1, T, F)
+        x = self.bn0(x.transpose(1, 3)).transpose(1, 3)
+        for block in (self.conv_block1, self.conv_block2, self.conv_block3, self.conv_block4):
+            x = block(x, pool_size=(2, 2))
+            x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)                             # mean over F -> (N, 512, T')
+        x = torch.max(x, dim=2)[0] + torch.mean(x, dim=2)    # max_T + mean_T -> (N, 512)
+        x = F.dropout(x, p=0.5, training=self.training)
+        return F.relu(self.fc1(x))
+
+
+# --------------------------------------------------------------------------- #
+# jACSDNet model
+# --------------------------------------------------------------------------- #
+READOUTS = ('proj', 'mf', 'mr', 'clf', 'logits')
+DEFAULT_READOUT = 'proj'
+
+DEFAULT_CONFIG = {
+    "version": JACSDNET_VERSION,
+    "input_dim": 32,           # number of gammatone frequency channels
+    "hidden_dim": [125, 150, 175, 200],
+    "kernel_size": [12, 12, 12, 12],
+    "n_neurons": 3124,         # concatenated over all 62 recording sites
+    "norm_1d": True,
+    "res_scale": 1.0,
+    "skip": True,
+    # classifier
+    "proj_dim": 128,           # LayerNorm(MR) -> Linear(3124 -> 128): the default embedding
+    "d_pen": 512,              # CNN10 fc1 width (readout 'clf')
+    "n_classes": 456,          # AudioSet strong-label ontology (readout 'logits')
+    "window_bins": 50,         # classifier window: 50 bins = 500 ms
+    # audio front end
+    "fs_gtg": 100,
+    "num_cfs": 32,
+    "f_min": 200.0,
+    "f_max": 20e3,
+    "overall_db": 60.0,
+    "fixed_amp_scale": 250.0,
+    "keep_pre_s": 0.0,
+    "stim_dur_after_onset": None,
+    "compress": "sqrt",
+    "level_mode": "exact",
+    "lbhb_mode": False,
+    "nems_match": False,
+    "stim_duration_s": None,
+}
+
+
+class JACSDNet(nn.Module):
+    """
+    Shared causal trunk -> concatenated neural readout (3124 rates) -> learned
+    128-d projection -> CNN10 sound-event classifier.
+
+    `get_embeddings(x, readout=...)` returns any stage; the default is the
+    128-d projection ('proj'). `predict_psth` returns the predicted PSTHs.
+    """
+
+    def __init__(self, config=None):
+        super().__init__()
+        cfg = dict(DEFAULT_CONFIG)
+        if config:
+            cfg.update(config)
+        self.config = cfg
+        self.version = cfg.get('version', JACSDNET_VERSION)
+        self.model_name = MODEL_NAME
+        self.audioset_labels = None    # filled by load_jacsdnet from the checkpoint
+        self.audioset_mids = None
+        self.cell_names = None
+
+        input_dim = cfg["input_dim"]
+        hidden_dim = cfg["hidden_dim"]
+        kernel_size = cfg["kernel_size"]
+        norm_1d = cfg["norm_1d"]
+        res_scale = cfg["res_scale"]
+        skip = cfg["skip"]
+
+        self.device = best_device()
+
+        self.audio_process = GammatoneFilterbankProcessing(
+            num_cfs=cfg["num_cfs"], f_min=cfg["f_min"], f_max=cfg["f_max"], fs_gtg=cfg["fs_gtg"],
+            overall_db=cfg["overall_db"], fixed_amp_scale=cfg["fixed_amp_scale"],
+            keep_pre_s=cfg["keep_pre_s"], stim_dur_after_onset=cfg["stim_dur_after_onset"],
+            compress=cfg["compress"], level_mode=cfg["level_mode"], lbhb_mode=cfg["lbhb_mode"],
+            nems_match=cfg["nems_match"], stim_duration_s=cfg["stim_duration_s"])
+
+        # Shared trunk: names match the original checkpoint (BlockCWR{i}).
+        self.layers_shared = nn.Sequential()
+        self.layers_shared.add_module("BlockCWR0", ResBlock_CNN1d_W_NL_v1(
+            input_dim=input_dim, output_dim=hidden_dim[0], kernel_size=kernel_size[0], norm_1d=norm_1d,
+            time_pool=1, postfix='0', in_channels=1, out_channels=1, skip=False))
+        for in_idx in range(len(hidden_dim) - 1):
+            out_idx = in_idx + 1
+            self.layers_shared.add_module(f"BlockCWR{out_idx}", ResBlock_CNN1d_W_NL_v1(
+                input_dim=hidden_dim[in_idx], output_dim=hidden_dim[out_idx], kernel_size=kernel_size[out_idx],
+                norm_1d=norm_1d, time_pool=1, postfix=str(out_idx), in_channels=1, out_channels=1,
+                skip=skip, res_scale=res_scale))
+
+        # Single concatenated neural readout (62 site-specific heads in training).
+        self.readout_linear = nn.Linear(hidden_dim[-1], cfg["n_neurons"])
+        self.readout_nl = DEXP(cfg["n_neurons"])
+
+        # Classifier: projection stem -> CNN10 -> AudioSet logits.
+        self.proj_stem = ProjStem(cfg["n_neurons"], cfg["proj_dim"])
+        self.cnn10 = Cnn10(n_freq=cfg["proj_dim"], d_pen=cfg["d_pen"])
+        self.logits = nn.Linear(cfg["d_pen"], cfg["n_classes"])
+
+    # --------------------------------------------------------------------- #
+    def to(self, *args, **kwargs):
+        """Move the model and keep the audio front end on the same device."""
+        super().to(*args, **kwargs)
+        dev = next(self.parameters()).device
+        self.device = dev
+        self.audio_process.device = dev
+        return self
+
+    def _device(self):
+        """Device the model's weights currently live on."""
+        return next(self.parameters()).device
+
+    def update_audio_process(self, params_audio_proc=None, verbose=False):
+        """Update a subset of audio-front-end params (e.g. `overall_db`)."""
+        if params_audio_proc:
+            allowed = {'overall_db', 'fixed_amp_scale', 'level_mode', 'lbhb_mode', 'keep_pre_s',
+                       'stim_dur_after_onset', 'compress', 'f_min', 'f_max', 'fs_gtg', 'num_cfs',
+                       'nems_match', 'stim_duration_s'}
+            for key, val in params_audio_proc.items():
+                if key in allowed:
+                    setattr(self.audio_process, key, val)
+                    self.config[key] = val
+                    if verbose:
+                        print(f"\t -> Updated {key} to {val}")
+        self.audio_process.device = self.device
+
+    def set_bnt_mode(self, overall_db, fixed_amp_scale, nems_match=False, verbose=False):
+        """Configure the front end the way the BNT training stimuli were built.
+
+        The BNT/baphy path is `remove_clicks(w * FixedAmpScale, 15)` followed by
+        a fixed `10**((80 - OveralldB)/20)` gain -- i.e. `lbhb_mode=True` with
+        `level_mode='approx'`. Both differ from the defaults, which target
+        arbitrary wavs at a known dB SPL. Take `overall_db` / `fixed_amp_scale`
+        from the recording's exptparams, never from a hardcoded constant.
+        """
+        self.update_audio_process(
+            {'lbhb_mode': True, 'level_mode': 'approx', 'overall_db': overall_db,
+             'fixed_amp_scale': fixed_amp_scale, 'nems_match': nems_match}, verbose=verbose)
+
+    def _to_gtg(self, x, fs=None):
+        # Always compute the gammatonegram on the same device as the weights.
+        dev = self._device()
+        self.device = dev
+        self.audio_process.device = dev
+
+        if isinstance(x, str):
+            # 32767 rather than 32768 when reproducing NEMS bit-for-bit; see _load_wav.
+            int16_scale = 32767.0 if self.audio_process.nems_match else 32768.0
+            waveform, fs = _load_wav(x, int16_scale=int16_scale)
+        elif isinstance(x, torch.Tensor) and fs is not None:
+            waveform = x
+        else:
+            raise ValueError("Input must be a path to a wav file or a (waveform, fs) pair.")
+        return self.audio_process(waveform.to(dev), fs)
+
+    def gtg_to_model_input(self, gtg, gtg_compress='sqrt'):
+        """Turn an externally computed gammatonegram into jACSDNet's model input.
+
+        jACSDNet's own input is sqrt(magnitude) -- the same domain as a NEMS
+        `stim` signal from `nems_lbhb.runclass.NAT_stim`. `gtg_compress` names
+        the compression already applied to `gtg`; it is undone to recover
+        magnitude, then the model's own compression is applied.
+
+        gtg : (time, num_cfs) or (num_cfs, time); gtg_compress : {'sqrt', 'none'}.
+        Returns a (time, num_cfs) tensor on the model's device.
+        """
+        dev = self._device()
+        if not isinstance(gtg, torch.Tensor):
+            gtg = torch.as_tensor(np.asarray(gtg, dtype=np.float32))
+        gtg = gtg.to(dev).float().squeeze()
+        if gtg.dim() != 2:
+            raise ValueError(f"Expected a 2-D gammatonegram, got shape {tuple(gtg.shape)}")
+
+        n_cfs = self.audio_process.num_cfs
+        if gtg.shape[-1] != n_cfs:
+            if gtg.shape[0] != n_cfs:
+                raise ValueError(f"Neither axis of {tuple(gtg.shape)} matches num_cfs={n_cfs}")
+            gtg = gtg.T  # (num_cfs, time) -> (time, num_cfs)
+
+        if gtg_compress == 'sqrt':
+            x_mag = gtg ** 2
+        elif gtg_compress in ('none', None, 'linear'):
+            x_mag = gtg
+        else:
+            raise ValueError(f"Unknown gtg_compress '{gtg_compress}'")
+        return self.audio_process.apply_compress(x_mag)
+
+    # --------------------------------------------------------------------- #
+    def readout_from_model_input(self, x, readout=DEFAULT_READOUT):
+        """Run model input (a compressed gammatonegram) through to `readout`.
+
+        x : (time, num_cfs) or (batch, time, num_cfs) tensor.
+        readout : one of READOUTS.
+          'mf'     (batch, time, 200)      trunk ("manifold")
+          'mr'     (batch, time, 3124)     predicted rates (spikes/bin)
+          'proj'   (batch, time, 128)      LayerNorm(MR) -> Linear, the default
+          'clf'    (batch, n_windows, 512) CNN10 fc1, one row per 500-ms window
+          'logits' (batch, n_windows, 456) AudioSet logits, one row per window
+
+        'clf' / 'logits' cut the input into consecutive 50-bin (500-ms) windows
+        from bin 0 after ONE causal pass over the whole input, so each window
+        keeps its full left context; a remainder shorter than 50 bins is
+        dropped. Inputs shorter than 500 ms raise ValueError.
+        """
+        if readout not in READOUTS:
+            raise ValueError(f"readout must be one of {READOUTS}, got {readout!r}")
+        if x.dim() == 2:
+            x = x[None]
+        h = self.layers_shared(x)
+        if readout == 'mf':
+            return h
+        rates = self.readout_nl(self.readout_linear(h))
+        if readout == 'mr':
+            return rates
+        if readout == 'proj':
+            return self.proj_stem(rates)
+        win = int(self.config['window_bins'])
+        n_batch, n_bins, n_cells = rates.shape
+        n_win = n_bins // win
+        if n_win < 1:
+            raise ValueError(f"'{readout}' needs at least {win} bins (500 ms) of input, got {n_bins}")
+        windows = rates[:, :n_win * win].reshape(n_batch * n_win, win, n_cells)
+        pen = self.cnn10(self.proj_stem(windows))
+        out = pen if readout == 'clf' else self.logits(pen)
+        return out.reshape(n_batch, n_win, -1)
+
+    def get_embeddings(self, x, fs=None, readout=DEFAULT_READOUT):
+        """
+        Return (rep, gtg) for a wav path, or a (1, n_samples) waveform tensor + fs.
+
+          rep -> see `readout_from_model_input` (default: (1, time, 128) projection)
+          gtg -> (time, frequency) model input
+        """
+        gtg = self._to_gtg(x, fs)
+        return self.readout_from_model_input(gtg, readout), gtg
+
+    def get_embeddings_from_gtg(self, gtg, gtg_compress='sqrt', readout=DEFAULT_READOUT):
+        """`get_embeddings` for a gammatonegram computed outside the model. Returns (rep, model_input)."""
+        x = self.gtg_to_model_input(gtg, gtg_compress)
+        return self.readout_from_model_input(x, readout), x
+
+    def get_mf_embeddings(self, x, fs=None):
+        """ACNet-compatible: (trunk embeddings (1, time, 200), gtg)."""
+        return self.get_embeddings(x, fs, readout='mf')
+
+    def predict_psth(self, x, fs=None, return_embeddings=False):
+        """
+        Predict every recorded neuron's PSTH for the input audio.
+
+        Returns psth -> (time, n_neurons); optionally also (trunk embeddings, gtg).
+        """
+        gtg = self._to_gtg(x, fs)
+        h = self.readout_from_model_input(gtg, 'mf')
+        psth = self.readout_nl(self.readout_linear(h)).squeeze(0)
+        if return_embeddings:
+            return psth, h, gtg
+        return psth
+
+    def predict_psth_from_gtg(self, gtg, gtg_compress='sqrt'):
+        """`predict_psth` for a gammatonegram computed outside the model."""
+        rates, _ = self.get_embeddings_from_gtg(gtg, gtg_compress, readout='mr')
+        return rates.squeeze(0)
+
+    def classify(self, x, fs=None, top_k=5):
+        """Top-k AudioSet classes per 500-ms window: a list (one per window) of (label, logit) pairs.
+
+        The logits come from a BCE head trained with a per-class positive weight, so
+        sigmoid(logit) is a ranking score, not a calibrated probability.
+        """
+        logits, _ = self.get_embeddings(x, fs, readout='logits')
+        logits = logits.squeeze(0).detach().cpu()
+        labels = self.audioset_labels or [str(i) for i in range(logits.shape[-1])]
+        out = []
+        for row in logits:
+            vals, idx = torch.topk(row, top_k)
+            out.append([(labels[i], float(v)) for v, i in zip(vals.tolist(), idx.tolist())])
+        return out
+
+
+def load_jacsdnet(weights_path=None, map_location=None):
+    """
+    Load jACSDNet from a standalone checkpoint.
+
+    Returns (model, cell_rtest) where `cell_rtest` is the per-neuron test-set
+    prediction correlation (Pearson r) of this model on the BNT held-out set.
+    The model exposes `model.version`, `model.model_name`, `model.audioset_labels`
+    (456 display names, logit order), `model.audioset_mids` and `model.cell_names`.
+    """
+    if weights_path is None:
+        weights_path = WEIGHTS_DEFAULT
+    if map_location is None:
+        map_location = best_device()
+
+    try:
+        ckpt = torch.load(weights_path, map_location=map_location, weights_only=True)
+    except Exception:
+        # Fallback for older torch or checkpoints with non-tensor payloads.
+        ckpt = torch.load(weights_path, map_location=map_location, weights_only=False)
+
+    model = JACSDNet(ckpt.get('config'))
+    model.load_state_dict(ckpt['state_dict'])
+    model.to(map_location)  # place params + audio front end on the usable device
+    model.eval()
+
+    model.version = ckpt.get('version', model.version)
+    model.model_name = ckpt.get('model_name', MODEL_NAME)
+    model.audioset_labels = list(ckpt.get('audioset_labels') or []) or None
+    model.audioset_mids = list(ckpt.get('audioset_mids') or []) or None
+    model.cell_names = list(ckpt.get('cell_names') or []) or None
+    print(f"Loaded {model.model_name} {model.version}")
+
+    cell_rtest = ckpt.get('cell_rtest')
+    if isinstance(cell_rtest, torch.Tensor):
+        cell_rtest = cell_rtest.cpu().numpy()
+    elif cell_rtest is not None:
+        cell_rtest = np.asarray(cell_rtest)
+    return model, cell_rtest
