@@ -1,0 +1,155 @@
+{
+ "n_clips": 2000,
+ "folds": [
+  0,
+  1,
+  2,
+  3,
+  4
+ ],
+ "readouts": {
+  "mr": {
+   "emb_pkl": "/auto/users/satya/code/projects_getting_started/neural_auditory_categorization/ACnetTCnet_joint/output/esc50_xmodel/embeddings/ESC50_500ms_60db_MFMR_jmc_eps0.3_cnn10_arc.pkl",
+   "clf_pkl": "/auto/users/satya/code/projects_getting_started/neural_auditory_categorization/ACnetTCnet_joint/output/esc50_xmodel/classifier/MLP_classifier_ESC50_jmc_eps0.3_cnn10_arc_mr.pkl",
+   "emb_rel_max_diff": 0.00021620006241371831,
+   "n_best": 1562,
+   "n_pool": 1562,
+   "folds": [
+    {
+     "fold_index": 0,
+     "test_fold": 2,
+     "n_test": 400,
+     "dprime_stored": 2.5143537849487902,
+     "dprime_standalone": 2.5143537849487902,
+     "acc_stored": 0.525,
+     "acc_standalone": 0.525,
+     "replay_of_stored_matches": true,
+     "pred_agreement": 1.0
+    },
+    {
+     "fold_index": 1,
+     "test_fold": 3,
+     "n_test": 400,
+     "dprime_stored": 2.752331161880118,
+     "dprime_standalone": 2.752331161880118,
+     "acc_stored": 0.5975,
+     "acc_standalone": 0.5975,
+     "replay_of_stored_matches": true,
+     "pred_agreement": 1.0
+    },
+    {
+     "fold_index": 2,
+     "test_fold": 4,
+     "n_test": 400,
+     "dprime_stored": 2.993525944730726,
+     "dprime_standalone": 2.993525944730726,
+     "acc_stored": 0.62,
+     "acc_standalone": 0.62,
+     "replay_of_stored_matches": true,
+     "pred_agreement": 1.0
+    },
+    {
+     "fold_index": 3,
+     "test_fold": 5,
+     "n_test": 400,
+     "dprime_stored": 2.548088955923607,
+     "dprime_standalone": 2.548088955923607,
+     "acc_stored": 0.54,
+     "acc_standalone": 0.54,
+     "replay_of_stored_matches": true,
+     "pred_agreement": 1.0
+    },
+    {
+     "fold_index": 4,
+     "test_fold": 1,
+     "n_test": 400,
+     "dprime_stored": 2.7729909256369765,
+     "dprime_standalone": 2.7729909256369765,
+     "acc_stored": 0.5925,
+     "acc_standalone": 0.5925,
+     "replay_of_stored_matches": true,
+     "pred_agreement": 1.0
+    }
+   ],
+   "dprime_stored_mean": 2.7162581546240436,
+   "dprime_standalone_mean": 2.7162581546240436,
+   "pass": true
+  },
+  "clf": {
+   "emb_pkl": "/auto/users/satya/code/projects_getting_started/neural_auditory_categorization/ACnetTCnet_joint/output/esc50_xmodel/embeddings/ESC50_500ms_60db_MFMR_jmc_eps0.3_cnn10_arc_clf.pkl",
+   "clf_pkl": "/auto/users/satya/code/projects_getting_started/neural_auditory_categorization/ACnetTCnet_joint/output/esc50_xmodel/classifier/MLP_classifier_ESC50_jmc_eps0.3_cnn10_arc_clf_mf.pkl",
+   "emb_rel_max_diff": 0.0002706177871811983,
+   "n_best": null,
+   "n_pool": null,
+   "folds": [
+    {
+     "fold_index": 0,
+     "test_fold": 2,
+     "n_test": 400,
+     "dprime_stored": 2.8538179881453822,
+     "dprime_standalone": 2.8538179881453822,
+     "acc_stored": 0.6,
+     "acc_standalone": 0.6,
+     "replay_of_stored_matches": true,
+     "pred_agreement": 1.0
+    },
+    {
+     "fold_index": 1,
+     "test_fold": 3,
+     "n_test": 400,
+     "dprime_stored": 2.845157751361458,
+     "dprime_standalone": 2.845157751361458,
+     "acc_stored": 0.5975,
+     "acc_standalone": 0.5975,
+     "replay_of_stored_matches": true,
+     "pred_agreement": 1.0
+    },
+    {
+     "fold_index": 2,
+     "test_fold": 4,
+     "n_test": 400,
+     "dprime_stored": 3.053993821098979,
+     "dprime_standalone": 3.053993821098979,
+     "acc_stored": 0.645,
+     "acc_standalone": 0.645,
+     "replay_of_stored_matches": true,
+     "pred_agreement": 1.0
+    },
+    {
+     "fold_index": 3,
+     "test_fold": 5,
+     "n_test": 400,
+     "dprime_stored": 2.774545011158777,
+     "dprime_standalone": 2.774545011158777,
+     "acc_stored": 0.61,
+     "acc_standalone": 0.61,
+     "replay_of_stored_matches": true,
+     "pred_agreement": 1.0
+    },
+    {
+     "fold_index": 4,
+     "test_fold": 1,
+     "n_test": 400,
+     "dprime_stored": 2.9257479495041707,
+     "dprime_standalone": 2.9257479495041707,
+     "acc_stored": 0.6025,
+     "acc_standalone": 0.6025,
+     "replay_of_stored_matches": true,
+     "pred_agreement": 1.0
+    }
+   ],
+   "dprime_stored_mean": 2.8906525042537536,
+   "dprime_standalone_mean": 2.8906525042537536,
+   "pass": true
+  }
+ },
+ "pass_all": true,
+ "tol_emb_rel": 0.001,
+ "tol_dprime": 1e-06,
+ "dbspl": 60.0,
+ "device": "cpu",
+ "host": "rhino",
+ "repo_sha": "ba6107a",
+ "analysis_code_sha": "2e402810-dirty",
+ "date": "2026-11-01 19:12:20"
+}

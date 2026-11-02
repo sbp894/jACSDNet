@@ -1,0 +1,22 @@
+{
+ "cell_mean": 0.35238763691053016,
+ "site_mean": 0.4067633712180786,
+ "ref_cell_mean": 0.3523876662983664,
+ "ref_site_mean": 0.406763379539638,
+ "max_abs_diff_per_cell": 2.5659799575805664e-05,
+ "median_abs_diff_per_cell": 2.9802322387695312e-08,
+ "n_cells": 3124,
+ "n_nan": 0,
+ "ref_n_nan": 0,
+ "shipped_cell_rtest_equals_ref": true,
+ "pass": true,
+ "tol_mean": 0.0001,
+ "tol_cell": 0.001,
+ "device": "cpu",
+ "host": "rhino",
+ "repo_sha": "ba6107a",
+ "training_code_sha": "2e402810-dirty",
+ "source_checkpoint": "/auto/users/satya/code/projects_getting_started/neural_auditory_categorization/ACnetTCnet_joint/output/checkpoints/jmc_p62_mega4k12_clfcnn10p128_eps0.3_L0.5_seed0_asb256_bnb256_asg2.985_spe1360_tb30_cratchet_refetch.pt",
+ "protocol": "train_joint.build_repeat_datasets test split (4 repeats spliced), per_cell_corr; site mean = nanmean over the 62 per-site means",
+ "date": "2026-11-01 19:12:33"
+}

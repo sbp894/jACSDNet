@@ -69,8 +69,10 @@ ax[1].imshow(proj.T, origin='lower', aspect='auto', extent=(0, dur_ms, 0, proj.s
 ax[1].set(ylabel='projection dim', title='jACSDNet embedding (128-d projection of predicted rates)')
 
 order = np.argsort(-cell_rtest) if cell_rtest is not None else np.arange(psth.shape[1])
-ax[2].imshow(psth[:, order].T, origin='lower', aspect='auto', extent=(0, dur_ms, 0, psth.shape[1]))
-ax[2].set(ylabel='neuron (sorted by r_test)', title='Predicted neural PSTHs', xlabel='time (ms)')
+psth_norm = psth / np.maximum(psth.max(axis=0, keepdims=True), 1e-12)   # each neuron to its own max, display only
+ax[2].imshow(psth_norm[:, order].T, origin='lower', aspect='auto', extent=(0, dur_ms, 0, psth.shape[1]))
+ax[2].set(ylabel='neuron (sorted by r_test)', title='Predicted neural PSTHs (each neuron / its max)',
+          xlabel='time (ms)')
 for w, row in enumerate(top):
     ax[0].text(500 * w + 10, gtg.shape[1] - 1, '\n'.join(lab for lab, _ in row), va='top', ha='left',
                fontsize=6, color='w')
