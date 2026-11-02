@@ -16,7 +16,7 @@ What it does, on CPU (determinism):
      jmc_readouts.py does (60 dB SPL, level_mode 'exact', lbhb_mode False, no as_gain).
   2. Copy weights into jacsdnet_model.JACSDNet: trunk as is; the 62 site heads concatenated into one Linear +
      DEXP (all 62 must be dexp ON); the projection stem, CNN10 and logits as is.
-  3. Parity: on the example clip and 4 ESC-50 500-ms clips, every readout (mf, mr, proj, clf, logits) of the
+  3. Parity: on the example clip, 4 ESC-50 500-ms clips and one 2.37-s input (4 classifier windows), every readout (mf, mr, proj, clf, logits) of the
      standalone must equal the original's (jmc_readouts.window_features for clf / logits), and the standalone
      front end must equal the acnetview's. Aborts before saving on any mismatch.
   4. Write weights/jacsdnet_v0.pt and validation/parity_fixture.npz (the original's outputs, for
@@ -41,6 +41,7 @@ VIEW = JOINT + 'output/checkpoints/' + TAG + '_acnetview.pt'
 EXAMPLE_WAV = os.path.join(REPO, 'examples', 'example_esc50_clip.wav')
 ESC50_DIR = '/auto/users/satya/code/projects_getting_started/downloaded/dataset/ESC-50-master/misc_out/ESC50_500ms_v0/'
 N_ESC50_FIXTURE = 4
+LONG_CLIP, LONG_BINS = '1-100032-A-0.wav', 237
 OUT_PT = os.path.join(REPO, 'weights', 'jacsdnet_v0.pt')
 OUT_FIXTURE = os.path.join(REPO, 'validation', 'parity_fixture.npz')
 TOL_REL = 1e-5            # CPU float32, same ops in the same order: expect ~0
@@ -136,6 +137,9 @@ def main():
     # ---- 3. parity
     esc_files = sorted(f for f in os.listdir(ESC50_DIR) if f.endswith('.wav'))[:N_ESC50_FIXTURE]
     items = [('example_esc50_clip.wav', EXAMPLE_WAV)] + [(f, ESC50_DIR + f) for f in esc_files]
+    # one multi-window input: a 5-s ESC-50 clip's gtg cut to 237 bins = 4 classifier windows + a 37-bin remainder
+    # that clf / logits must drop (the trunk is causal, so the cut changes nothing before bin 237)
+    items.append((LONG_CLIP + f'[:{LONG_BINS}]', eme.WAV_DIR_5S + LONG_CLIP))
     fixture, report = {}, {}
     with torch.no_grad():
         for i, (name, path) in enumerate(items):
@@ -143,6 +147,8 @@ def main():
             gtg_ref = view.audio_process(w, fs).squeeze().cpu()              # (T, 32), the original front end
             gtg_sa = sa._to_gtg(path)                                         # stdlib wav loader + copied front end
             r_gtg = rel_max(gtg_sa.numpy(), gtg_ref.numpy())
+            if name.endswith(f'[:{LONG_BINS}]'):
+                gtg_ref = gtg_ref[:LONG_BINS]
             x = gtg_ref[None]
             h_ref = joint.layers_shared(x)
             mr_ref = joint.rates(h_ref)
