@@ -32,7 +32,12 @@ JOINT = NAC + 'ACnetTCnet_joint/'
 ESC50_DIR = '/auto/users/satya/code/projects_getting_started/downloaded/dataset/ESC-50-master/misc_out/ESC50_500ms_v0/'
 KEY = 'jmc_eps0.3_cnn10_arc'          # J0 seed 0 in the ESC-50 registry
 OUT_JSON = os.path.join(REPO, 'validation', 'results', 'esc50_dprime_v0.json')
-TOL_EMB_REL = 1e-4                    # jmc_readouts' EQUIV_RTOL
+# The stored dumps were computed on a GPU: the ORIGINAL training-code model, run on CPU over all 2000 clips, differs
+# from them by 2.16e-4 (MR) / 2.71e-4 (CLF) relative max -- exactly the standalone's gap -- while standalone vs
+# original-CPU is 1.2e-7 / 4.3e-7 and the gammatonegrams are identical (validation/claude_debug/
+# debug_original_cpu_all_esc50.py, 2026-11-01). So the embedding gate is 1e-3, and the d' / prediction gates carry
+# the weight.
+TOL_EMB_REL = 1e-3
 TOL_DPRIME = 1e-6
 DBSPL = 60.0
 
@@ -96,6 +101,7 @@ def main():
     folds_req = [int(f) for f in args.folds.split(',')]
     device = torch.device(args.device)
     t0 = time.time()
+    repo_sha, analysis_sha = git_sha(REPO), git_sha(JOINT)     # at start: the code that actually ran
 
     model, _ = load_jacsdnet(map_location=device)
     model.update_audio_process({'overall_db': DBSPL, 'level_mode': 'exact', 'lbhb_mode': False})
@@ -158,7 +164,7 @@ def main():
               f"{out['dprime_stored_mean']:.4f} standalone {out['dprime_standalone_mean']:.4f} | "
               f"{'PASS' if out['pass'] else 'FAIL'}", flush=True)
     res.update(pass_all=bool(ok), tol_emb_rel=TOL_EMB_REL, tol_dprime=TOL_DPRIME, dbspl=DBSPL, device=str(device),
-               host=socket.gethostname().split('.')[0], repo_sha=git_sha(REPO), analysis_code_sha=git_sha(JOINT),
+               host=socket.gethostname().split('.')[0], repo_sha=repo_sha, analysis_code_sha=analysis_sha,
                date=time.strftime('%F %T'))
     os.makedirs(os.path.dirname(OUT_JSON), exist_ok=True)
     with open(OUT_JSON, 'w') as fh:

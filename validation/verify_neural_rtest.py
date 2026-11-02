@@ -49,6 +49,7 @@ def main():
     args = ap.parse_args()
     device = torch.device(args.device)
     t0 = time.time()
+    repo_sha, training_sha = git_sha(REPO), git_sha(JOINT)     # at start: the code that actually ran
 
     blob = torch.load(SRC_CKPT, map_location='cpu', weights_only=False)
     ref = blob['metrics']
@@ -92,7 +93,7 @@ def main():
                        and res['max_abs_diff_per_cell'] < TOL_CELL and res['n_nan'] == res['ref_n_nan']
                        and res['shipped_cell_rtest_equals_ref'])
     res.update(tol_mean=TOL_MEAN, tol_cell=TOL_CELL, device=str(device), host=socket.gethostname().split('.')[0],
-               repo_sha=git_sha(REPO), training_code_sha=git_sha(JOINT), source_checkpoint=SRC_CKPT,
+               repo_sha=repo_sha, training_code_sha=training_sha, source_checkpoint=SRC_CKPT,
                protocol='train_joint.build_repeat_datasets test split (4 repeats spliced), per_cell_corr; '
                         'site mean = nanmean over the 62 per-site means',
                date=time.strftime('%F %T'))
