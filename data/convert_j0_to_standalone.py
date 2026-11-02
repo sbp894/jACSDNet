@@ -92,6 +92,7 @@ def main():
     view.params_audio_proc['model_mode'] = 'audio'
     view.update_audio_process(params_audio_proc={'overall_db': eme.DBSPL, 'level_mode': eme.LEVEL_MODE,
                                                  'lbhb_mode': eme.LBHB_MODE}, verbose=True)
+    view.audio_process.device = device                     # update_audio_process rebuilds it on the GPU if one exists
     view.eval()
     joint, blob = jmc.load_joint_megaclf(CKPT, device)
     n_same = jr.assert_same_trunk(joint, view)
@@ -139,7 +140,7 @@ def main():
     with torch.no_grad():
         for i, (name, path) in enumerate(items):
             w, fs = torchaudio.load(path)
-            gtg_ref = view.audio_process(w, fs).squeeze()                    # (T, 32), the original front end
+            gtg_ref = view.audio_process(w, fs).squeeze().cpu()              # (T, 32), the original front end
             gtg_sa = sa._to_gtg(path)                                         # stdlib wav loader + copied front end
             r_gtg = rel_max(gtg_sa.numpy(), gtg_ref.numpy())
             x = gtg_ref[None]
