@@ -545,6 +545,7 @@ class JACSDNet(nn.Module):
         self.audioset_labels = None    # filled by load_jacsdnet from the checkpoint
         self.audioset_mids = None
         self.cell_names = None
+        self.provenance = None         # source checkpoint, training SHA, stored metrics, parity report
 
         input_dim = cfg["input_dim"]
         hidden_dim = cfg["hidden_dim"]
@@ -770,7 +771,8 @@ def load_jacsdnet(weights_path=None, map_location=None):
     Returns (model, cell_rtest) where `cell_rtest` is the per-neuron test-set
     prediction correlation (Pearson r) of this model on the BNT held-out set.
     The model exposes `model.version`, `model.model_name`, `model.audioset_labels`
-    (456 display names, logit order), `model.audioset_mids` and `model.cell_names`.
+    (456 display names, logit order), `model.audioset_mids`, `model.cell_names`
+    and `model.provenance` (source checkpoint, stored metrics, conversion parity).
     """
     if weights_path is None:
         weights_path = WEIGHTS_DEFAULT
@@ -793,6 +795,7 @@ def load_jacsdnet(weights_path=None, map_location=None):
     model.audioset_labels = list(ckpt.get('audioset_labels') or []) or None
     model.audioset_mids = list(ckpt.get('audioset_mids') or []) or None
     model.cell_names = list(ckpt.get('cell_names') or []) or None
+    model.provenance = ckpt.get('provenance')
     print(f"Loaded {model.model_name} {model.version}")
 
     cell_rtest = ckpt.get('cell_rtest')
